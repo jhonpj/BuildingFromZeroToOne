@@ -19,29 +19,13 @@ jobs:
           git config --global http.postBuffer 524288000
           git config --global http.lowSpeedLimit 0
           git config --global http.lowSpeedTime 999999
-          
-          # ========== 核心：彻底禁用LFS所有检查 ==========
-          # 跳过LFS拉取
-          git config --global filter.lfs.smudge "git-lfs smudge --skip %f"
-          git config --global filter.lfs.process "git-lfs filter-process --skip"
-          git config --global filter.lfs.required false
-          # 允许不完整的LFS推送（关键：解决推送拦截）
-          git config --global lfs.allowincompletepush true
-          # 直接禁用LFS（终极方案）
-          git config --global lfs.enabled false
-          
-          export GIT_LFS_SKIP_SMUDGE=1
-          export GIT_LFS_ENABLED=0
-          
-          # 安装jq
+          # 安装依赖
           sudo apt-get update && sudo apt-get install -y jq
 
       - name: Batch Sync Repos
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           GITHUB_USER: "jhonpj"
-          GIT_LFS_SKIP_SMUDGE: 1
-          GIT_LFS_ENABLED: 0
         run: |
           set -euo pipefail
           
@@ -100,39 +84,44 @@ jobs:
             fi
             echo "✅ 源仓库默认分支：$SOURCE_DEFAULT_BRANCH"
 
-            # 3. 直接镜像同步
-            echo "开始同步代码..."
+            # 3. 终极方案：只同步文件内容（抛弃原有提交历史）
+            echo "开始同步纯文件内容（绕开LFS）..."
             TEMP_DIR=$(mktemp -d)
-            cd $TEMP_DIR
+            SOURCE_ARCHIVE_URL="https://github.com/$SOURCE_REPO_FULL/archive/refs/heads/$SOURCE_DEFAULT_BRANCH.tar.gz"
             
-            # 初始化空仓库 + 本地禁用LFS（双重保障）
+            # ========== 核心：下载源仓库纯文件压缩包（无提交历史） ==========
+            echo "下载源仓库文件包：$SOURCE_ARCHIVE_URL"
+            curl -sL "$SOURCE_ARCHIVE_URL" -o "$TEMP_DIR/source.tar.gz"
+            
+            # 解压文件
+            mkdir -p "$TEMP_DIR/source_files"
+            tar -zxf "$TEMP_DIR/source.tar.gz" -C "$TEMP_DIR/source_files" --strip-components=1
+            
+            # 初始化目标仓库本地版本
+            cd "$TEMP_DIR"
+            mkdir -p target_repo
+            cd target_repo
             git init
-            git config lfs.enabled false  # 仓库级禁用LFS
-            git config lfs.allowincompletepush true
             git remote add origin "$TARGET_REPO_URL"
-            git remote add source "https://github.com/$SOURCE_REPO_FULL.git"
             
-            # 拉取代码（仅普通文件）
-            git fetch source "$SOURCE_DEFAULT_BRANCH" --tags
-            git checkout -b main "source/$SOURCE_DEFAULT_BRANCH"
+            # 把源文件复制到目标仓库目录（覆盖原有内容）
+            cp -rf "$TEMP_DIR/source_files/"* .
             
-            # 彻底清理LFS相关配置
-            if [ -f ".gitattributes" ]; then
-              # 删除所有LFS相关行
-              sed -i '/lfs/d' .gitattributes
-              git add .gitattributes || true
-              git commit -m "Remove all LFS tracking rules" || true
-            fi
+            # 可选：删除可能的LFS配置文件（彻底清理）
+            rm -f .gitattributes .lfsconfig
             
-            # ========== 关键：推送时强制忽略LFS ==========
+            # 重新提交所有文件（生成全新提交，无LFS引用）
+            git add .
+            git commit -m "Sync files from $SOURCE_REPO_FULL ($SOURCE_DEFAULT_BRANCH) [skip LFS]" || true
+            
+            # 强制推送到目标仓库
             echo "推送到目标仓库..."
-            # 禁用LFS推送 + 强制推送，确保成功
-            GIT_LFS_ENABLED=0 git push origin main -f --no-verify || GIT_LFS_ENABLED=0 git push origin main -f
+            git push origin main -f --no-verify
             
             # 清理
-            cd ..
-            rm -rf $TEMP_DIR
+            cd ../..
+            rm -rf "$TEMP_DIR"
             
-            echo "✅ $TARGET_REPO_NAME 同步完成！"
+            echo "✅ $TARGET_REPO_NAME 同步完成（纯文件内容，无LFS引用）！"
             echo "----------------------------------------"
           done
