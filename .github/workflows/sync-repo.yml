@@ -2,8 +2,8 @@ name: Batch Sync with Auto Create Repo
 
 on:
   schedule:
-    - cron: '0 18 * * *'  # 北京时间凌晨2点执行（UTC 18点）
-  workflow_dispatch:      # 手动触发
+    - cron: '0 18 * * *'
+  workflow_dispatch:
 
 jobs:
   batch-sync:
@@ -11,45 +11,43 @@ jobs:
     steps:
       - name: Configure Git and Env
         run: |
-          # 配置Git身份（已改为你的真实信息）
           git config --global user.name "jhonpj"
           git config --global user.email "pengjingmine@163.com"
-          # 设置GitHub用户名（改为你的真实用户名jhonpj，关键修复！）
           echo "GITHUB_USER=jhonpj" >> $GITHUB_ENV
+          # 配置Git大文件传输参数（关键修复）
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+          git config --global core.compression 0
 
       - name: Batch Sync Repos (Auto Create if Not Exist)
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          GITHUB_USER: ${{ env.GITHUB_USER }}  # 传递到Shell环境
+          GITHUB_USER: ${{ env.GITHUB_USER }}
         run: |
-          set -euo pipefail  # 开启严格模式，出错立即终止
+          set -euo pipefail
           
-          # ========== 配置同步列表 ==========
           SYNC_LIST=(
             "https://github.com/openclaw/openclaw.git my-openclaw"
-            # 可继续添加："源仓库URL 目标仓库名"
+            # 可继续添加仓库
           )
 
-          # ========== 核心逻辑 ==========
           for ITEM in "${SYNC_LIST[@]}"; do
-            # 拆分源仓库和目标仓库名（处理空格问题）
             IFS=' ' read -r -a PARTS <<< "$ITEM"
             SOURCE_REPO="${PARTS[0]}"
             TARGET_REPO_NAME="${PARTS[1]}"
             TARGET_REPO_URL="https://github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
+            AUTH_TARGET_URL="https://$SYNC_TOKEN@github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
             echo "===== 开始处理：$TARGET_REPO_NAME ====="
 
-            # 1. 检查目标仓库是否存在（修复API调用，用Shell变量）
-            echo "检查仓库 $GITHUB_USER/$TARGET_REPO_NAME 是否存在..."
+            # 1. 检查并创建仓库（保留原有逻辑）
             RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $SYNC_TOKEN" \
               -H "Accept: application/vnd.github.v3+json" \
               "https://api.github.com/repos/$GITHUB_USER/$TARGET_REPO_NAME")
 
-            # 2. 不存在则创建仓库（修复JSON转义问题）
             if [ "$RESPONSE" = "404" ]; then
-              echo "仓库不存在，开始创建 $TARGET_REPO_NAME..."
-              # 用变量存储JSON，避免YAML转义冲突
+              echo "创建仓库 $TARGET_REPO_NAME..."
               CREATE_JSON=$(jq -n \
                 --arg name "$TARGET_REPO_NAME" \
                 '{
@@ -66,48 +64,71 @@ jobs:
                 https://api.github.com/user/repos \
                 -d "$CREATE_JSON")
               
-              # 检查创建结果
               if echo "$CREATE_RESP" | jq -e '.id' > /dev/null 2>&1; then
-                echo "✅ 仓库 $TARGET_REPO_NAME 创建成功！"
-                sleep 5  # 延长等待，确保仓库同步到Git服务器
+                echo "✅ 仓库创建成功，等待10秒同步..."
+                sleep 10  # 延长等待时间
               else
-                echo "❌ 仓库 $TARGET_REPO_NAME 创建失败：$CREATE_RESP"
+                echo "❌ 仓库创建失败：$CREATE_RESP"
                 continue
               fi
             elif [ "$RESPONSE" = "200" ]; then
-              echo "ℹ️ 仓库 $TARGET_REPO_NAME 已存在，跳过创建"
+              echo "ℹ️ 仓库已存在"
             else
-              echo "⚠️ 检查仓库状态失败，HTTP码：$RESPONSE，跳过该仓库"
+              echo "⚠️ 检查仓库失败，HTTP码：$RESPONSE"
               continue
             fi
 
-            # 3. 克隆目标仓库（带凭证，避免权限问题）
-            echo "克隆目标仓库 $TARGET_REPO_URL..."
+            # 2. 克隆目标仓库（关闭浅克隆，拉取完整历史）
+            echo "克隆目标仓库..."
             TEMP_DIR=$(mktemp -d)
-            # 替换URL为带TOKEN的格式，避免克隆/推送权限不足
-            AUTH_TARGET_URL="https://$SYNC_TOKEN@github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
-            git clone --depth 1 $AUTH_TARGET_URL $TEMP_DIR
+            # 删除原有仓库（如果存在），避免冲突
+            rm -rf $TEMP_DIR
+            git clone --no-shallow $AUTH_TARGET_URL $TEMP_DIR || {
+              # 克隆失败则重新初始化仓库
+              echo "克隆失败，重新初始化仓库..."
+              mkdir -p $TEMP_DIR
+              cd $TEMP_DIR
+              git init
+              git remote add origin $AUTH_TARGET_URL
+              cd ..
+            }
             cd $TEMP_DIR
 
-            # 4. 同步源仓库代码（自动检测主分支）
-            echo "同步源仓库 $SOURCE_REPO 代码..."
-            git remote add source $SOURCE_REPO
-            git fetch source --tags --depth 1
+            # 3. 修复分支识别逻辑（关键！）
+            echo "检测源仓库主分支..."
+            # 方法1：先尝试获取源仓库默认分支（最准确）
+            DEFAULT_BRANCH=$(curl -s \
+              -H "Authorization: token $SYNC_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "$SOURCE_REPO" | jq -r '.default_branch // "main"')
             
-            # 自动检测源仓库主分支（兼容main/master）
-            SOURCE_BRANCH=$(git ls-remote --heads source | grep -E 'main|master' | awk '{print $2}' | sed 's/refs\/heads\///' | head -1)
-            if [ -z "$SOURCE_BRANCH" ]; then
-              SOURCE_BRANCH="main"  # 默认分支
+            # 方法2：备用方案（只取main/master）
+            if [ "$DEFAULT_BRANCH" != "main" ] && [ "$DEFAULT_BRANCH" != "master" ]; then
+              echo "默认分支非main/master，尝试检测main/master..."
+              DEFAULT_BRANCH=$(git ls-remote --heads $SOURCE_REPO | grep -E 'refs/heads/main|refs/heads/master' | awk '{print $2}' | sed 's/refs\/heads\///' | head -1 || echo "main")
             fi
-            echo "检测到源仓库主分支：$SOURCE_BRANCH"
+            
+            echo "✅ 最终选择分支：$DEFAULT_BRANCH"
 
-            # 强制覆盖目标仓库
-            git reset --hard "source/$SOURCE_BRANCH"
-            git push origin HEAD:main -f  # 推送到目标仓库main分支
+            # 4. 同步源仓库代码（完整拉取，避免提交缺失）
+            git remote add source $SOURCE_REPO
+            # 完整拉取指定分支，不浅克隆
+            git fetch source $DEFAULT_BRANCH --tags --no-tags --depth=0
+            # 强制重置到源仓库分支
+            git checkout -B main source/$DEFAULT_BRANCH
+            git reset --hard source/$DEFAULT_BRANCH
 
-            # 5. 清理临时文件
+            # 5. 推送代码（优化推送策略）
+            echo "推送代码到目标仓库..."
+            # 先推送分支，再推送标签（分开推送降低压力）
+            git push origin main -f --no-thin || {
+              echo "首次推送失败，重试推送..."
+              git push origin main -f --no-thin  # 重试一次
+            }
+
+            # 6. 清理
             cd ..
             rm -rf $TEMP_DIR
-            echo "✅ 仓库 $TARGET_REPO_NAME 同步完成！"
+            echo "✅ $TARGET_REPO_NAME 同步完成！"
             echo "----------------------------------------"
           done
