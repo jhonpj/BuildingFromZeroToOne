@@ -33,6 +33,8 @@ jobs:
           # 格式："源仓库所有者/源仓库名 目标仓库名"
           SYNC_LIST=(
             "openclaw/openclaw my-openclaw"
+            "chaitin/PandaWiki PandaWiki" 
+            "chaitin/MonkeyCode MonkeyCode" 
             # 可继续添加："owner/repo target-repo"
           )
 
