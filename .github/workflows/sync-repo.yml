@@ -20,8 +20,7 @@ jobs:
           git config --global http.lowSpeedLimit 0
           git config --global http.lowSpeedTime 999999
           
-          # ========== 新增：彻底禁用Git LFS（核心修复） ==========
-          # 跳过LFS文件拉取，避免缺失文件导致失败
+          # 彻底禁用Git LFS（核心修复，无需--no-lfs参数）
           git config --global filter.lfs.smudge "git-lfs smudge --skip %f"
           git config --global filter.lfs.process "git-lfs filter-process --skip"
           git config --global filter.lfs.required false
@@ -34,7 +33,7 @@ jobs:
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           GITHUB_USER: "jhonpj"
-          GIT_LFS_SKIP_SMUDGE: 1  # 新增：环境变量层禁用LFS
+          GIT_LFS_SKIP_SMUDGE: 1
         run: |
           set -euo pipefail
           
@@ -82,7 +81,7 @@ jobs:
               continue
             fi
 
-            # 2. 获取源仓库默认分支（关键修复！使用正确的API URL）
+            # 2. 获取源仓库默认分支
             echo "获取源仓库默认分支..."
             SOURCE_DEFAULT_BRANCH=$(curl -s \
               -H "Authorization: token $SYNC_TOKEN" \
@@ -94,7 +93,7 @@ jobs:
             fi
             echo "✅ 源仓库默认分支：$SOURCE_DEFAULT_BRANCH"
 
-            # 3. 直接镜像同步（最简单稳定的方式）
+            # 3. 直接镜像同步（移除错误的--no-lfs参数）
             echo "开始同步代码..."
             TEMP_DIR=$(mktemp -d)
             cd $TEMP_DIR
@@ -104,8 +103,8 @@ jobs:
             git remote add origin "$TARGET_REPO_URL"
             git remote add source "https://github.com/$SOURCE_REPO_FULL.git"
             
-            # ========== 新增：拉取时明确跳过LFS ==========
-            git fetch source "$SOURCE_DEFAULT_BRANCH" --tags --no-lfs
+            # ========== 关键修正：移除--no-lfs参数 ==========
+            git fetch source "$SOURCE_DEFAULT_BRANCH" --tags
             git checkout -b main "source/$SOURCE_DEFAULT_BRANCH"
             
             # 可选：移除LFS追踪规则，避免后续触发LFS
