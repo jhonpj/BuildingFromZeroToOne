@@ -15,10 +15,6 @@ jobs:
           git config --global user.name "jhonpj"
           git config --global user.email "pengjingmine@163.com"
           git config --global init.defaultBranch main
-          # 优化Git传输
-          git config --global http.postBuffer 524288000
-          git config --global http.lowSpeedLimit 0
-          git config --global http.lowSpeedTime 999999
           # 安装依赖
           sudo apt-get update && sudo apt-get install -y jq
 
@@ -36,13 +32,25 @@ jobs:
             "chaitin/MonkeyCode MonkeyCode" 
           )
 
+          # ========== 工具函数：删除LFS指针文件 ==========
+          remove_lfs_pointer_files() {
+            local target_dir="$1"
+            echo "🔍 扫描并删除 $target_dir 中的LFS指针文件..."
+            
+            # LFS指针文件特征：首行是 "version https://git-lfs.github.com/spec/v1"
+            find "$target_dir" -type f -exec grep -l "version https://git-lfs.github.com/spec/v1" {} \; | while read -r lfs_file; do
+              echo "🗑️ 删除LFS指针文件：$lfs_file"
+              rm -f "$lfs_file"
+            done
+          }
+
           for ITEM in "${SYNC_LIST[@]}"; do
             IFS=' ' read -r -a PARTS <<< "$ITEM"
             SOURCE_REPO_FULL="${PARTS[0]}"
             TARGET_REPO_NAME="${PARTS[1]}"
             TARGET_REPO_URL="https://$SYNC_TOKEN@github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
             
-            echo "===== 开始处理：$TARGET_REPO_NAME ====="
+            echo -e "\n===== 开始处理：$TARGET_REPO_NAME ====="
             echo "源仓库：$SOURCE_REPO_FULL"
 
             # 1. 检查目标仓库是否存在，不存在则创建
@@ -84,44 +92,59 @@ jobs:
             fi
             echo "✅ 源仓库默认分支：$SOURCE_DEFAULT_BRANCH"
 
-            # 3. 终极方案：只同步文件内容（抛弃原有提交历史）
-            echo "开始同步纯文件内容（绕开LFS）..."
+            # 3. 终极方案：下载纯文件 + 删除LFS指针 + 重新提交
+            echo "开始同步纯文件内容（彻底清理LFS）..."
             TEMP_DIR=$(mktemp -d)
             SOURCE_ARCHIVE_URL="https://github.com/$SOURCE_REPO_FULL/archive/refs/heads/$SOURCE_DEFAULT_BRANCH.tar.gz"
             
-            # ========== 核心：下载源仓库纯文件压缩包（无提交历史） ==========
+            # 下载源仓库压缩包
             echo "下载源仓库文件包：$SOURCE_ARCHIVE_URL"
-            curl -sL "$SOURCE_ARCHIVE_URL" -o "$TEMP_DIR/source.tar.gz"
+            curl -sL "$SOURCE_ARCHIVE_URL" -o "$TEMP_DIR/source.tar.gz" || {
+              echo "❌ 下载压缩包失败，跳过当前仓库"
+              continue
+            }
             
             # 解压文件
             mkdir -p "$TEMP_DIR/source_files"
-            tar -zxf "$TEMP_DIR/source.tar.gz" -C "$TEMP_DIR/source_files" --strip-components=1
-            
-            # 初始化目标仓库本地版本
-            cd "$TEMP_DIR"
-            mkdir -p target_repo
-            cd target_repo
+            tar -zxf "$TEMP_DIR/source.tar.gz" -C "$TEMP_DIR/source_files" --strip-components=1 || {
+              echo "❌ 解压压缩包失败，跳过当前仓库"
+              continue
+            }
+
+            # ========== 核心：删除所有LFS指针文件 ==========
+            remove_lfs_pointer_files "$TEMP_DIR/source_files"
+
+            # 初始化目标仓库并提交
+            mkdir -p "$TEMP_DIR/target_repo"
+            cd "$TEMP_DIR/target_repo"
             git init
             git remote add origin "$TARGET_REPO_URL"
             
-            # 把源文件复制到目标仓库目录（覆盖原有内容）
-            cp -rf "$TEMP_DIR/source_files/"* .
+            # 复制清理后的文件（无LFS指针）
+            cp -rf "$TEMP_DIR/source_files/"* . 2>/dev/null || true
             
-            # 可选：删除可能的LFS配置文件（彻底清理）
-            rm -f .gitattributes .lfsconfig
+            # 彻底清理LFS相关配置
+            rm -f .gitattributes .lfsconfig .gitignore_lfs
             
-            # 重新提交所有文件（生成全新提交，无LFS引用）
+            # 重新提交（无任何LFS相关内容）
             git add .
-            git commit -m "Sync files from $SOURCE_REPO_FULL ($SOURCE_DEFAULT_BRANCH) [skip LFS]" || true
+            git commit -m "Sync from $SOURCE_REPO_FULL (clean LFS) $(date +%Y-%m-%d)" || {
+              echo "ℹ️ 无文件需要提交（内容未变更）"
+            }
             
-            # 强制推送到目标仓库
+            # 强制推送（终极保障：--no-verify跳过所有钩子）
             echo "推送到目标仓库..."
-            git push origin main -f --no-verify
+            git push origin main -f --no-verify || {
+              echo "⚠️ 首次推送失败，重试一次..."
+              git push origin main -f --no-verify
+            }
             
             # 清理
             cd ../..
             rm -rf "$TEMP_DIR"
             
-            echo "✅ $TARGET_REPO_NAME 同步完成（纯文件内容，无LFS引用）！"
+            echo "✅ $TARGET_REPO_NAME 同步完成（彻底清理LFS）！"
             echo "----------------------------------------"
           done
+          
+          echo -e "\n===== ✨ 所有仓库同步完成 ====="
