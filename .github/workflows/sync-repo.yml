@@ -20,11 +20,18 @@ jobs:
           git config --global http.lowSpeedLimit 0
           git config --global http.lowSpeedTime 999999
           
-          # 彻底禁用Git LFS（核心修复，无需--no-lfs参数）
+          # ========== 核心：彻底禁用LFS所有检查 ==========
+          # 跳过LFS拉取
           git config --global filter.lfs.smudge "git-lfs smudge --skip %f"
           git config --global filter.lfs.process "git-lfs filter-process --skip"
           git config --global filter.lfs.required false
+          # 允许不完整的LFS推送（关键：解决推送拦截）
+          git config --global lfs.allowincompletepush true
+          # 直接禁用LFS（终极方案）
+          git config --global lfs.enabled false
+          
           export GIT_LFS_SKIP_SMUDGE=1
+          export GIT_LFS_ENABLED=0
           
           # 安装jq
           sudo apt-get update && sudo apt-get install -y jq
@@ -34,6 +41,7 @@ jobs:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           GITHUB_USER: "jhonpj"
           GIT_LFS_SKIP_SMUDGE: 1
+          GIT_LFS_ENABLED: 0
         run: |
           set -euo pipefail
           
@@ -42,7 +50,6 @@ jobs:
             "openclaw/openclaw my-openclaw"
             "chaitin/PandaWiki PandaWiki" 
             "chaitin/MonkeyCode MonkeyCode" 
-            # 可继续添加："owner/repo target-repo"
           )
 
           for ITEM in "${SYNC_LIST[@]}"; do
@@ -93,30 +100,34 @@ jobs:
             fi
             echo "✅ 源仓库默认分支：$SOURCE_DEFAULT_BRANCH"
 
-            # 3. 直接镜像同步（移除错误的--no-lfs参数）
+            # 3. 直接镜像同步
             echo "开始同步代码..."
             TEMP_DIR=$(mktemp -d)
             cd $TEMP_DIR
             
-            # 初始化空仓库
+            # 初始化空仓库 + 本地禁用LFS（双重保障）
             git init
+            git config lfs.enabled false  # 仓库级禁用LFS
+            git config lfs.allowincompletepush true
             git remote add origin "$TARGET_REPO_URL"
             git remote add source "https://github.com/$SOURCE_REPO_FULL.git"
             
-            # ========== 关键修正：移除--no-lfs参数 ==========
+            # 拉取代码（仅普通文件）
             git fetch source "$SOURCE_DEFAULT_BRANCH" --tags
             git checkout -b main "source/$SOURCE_DEFAULT_BRANCH"
             
-            # 可选：移除LFS追踪规则，避免后续触发LFS
+            # 彻底清理LFS相关配置
             if [ -f ".gitattributes" ]; then
-              sed -i '/filter=lfs/d' .gitattributes
+              # 删除所有LFS相关行
+              sed -i '/lfs/d' .gitattributes
               git add .gitattributes || true
-              git commit -m "Remove LFS tracking" || true
+              git commit -m "Remove all LFS tracking rules" || true
             fi
             
-            # 强制推送到目标仓库
+            # ========== 关键：推送时强制忽略LFS ==========
             echo "推送到目标仓库..."
-            git push origin main -f --force-with-lease || git push origin main -f
+            # 禁用LFS推送 + 强制推送，确保成功
+            GIT_LFS_ENABLED=0 git push origin main -f --no-verify || GIT_LFS_ENABLED=0 git push origin main -f
             
             # 清理
             cd ..
