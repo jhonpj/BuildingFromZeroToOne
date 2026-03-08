@@ -11,77 +11,106 @@ jobs:
     steps:
       - name: Configure Git and Env
         run: |
-          # 配置Git身份
+          # 配置Git身份（已改为你的真实信息）
           git config --global user.name "jhonpj"
           git config --global user.email "pengjingmine@163.com"
-          # 设置GitHub用户名（后续API调用用）
-          echo "GITHUB_USER=你的GitHub用户名" >> $GITHUB_ENV
+          # 设置GitHub用户名（改为你的真实用户名jhonpj，关键修复！）
+          echo "GITHUB_USER=jhonpj" >> $GITHUB_ENV
 
       - name: Batch Sync Repos (Auto Create if Not Exist)
         env:
-          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}  # 你的PAT令牌
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          GITHUB_USER: ${{ env.GITHUB_USER }}  # 传递到Shell环境
         run: |
+          set -euo pipefail  # 开启严格模式，出错立即终止
+          
           # ========== 配置同步列表 ==========
-          # 格式："源仓库地址 你的目标仓库名"（注意：目标仓库名是纯名称，不是完整URL）
           SYNC_LIST=(
             "https://github.com/openclaw/openclaw.git my-openclaw"
             # 可继续添加："源仓库URL 目标仓库名"
           )
 
-          # ========== 核心逻辑：检查+创建仓库 + 同步 ==========
+          # ========== 核心逻辑 ==========
           for ITEM in "${SYNC_LIST[@]}"; do
-            # 拆分源仓库URL和目标仓库名
-            read -r SOURCE_REPO TARGET_REPO_NAME <<< "$ITEM"
-            TARGET_REPO_URL="https://github.com/${{ env.GITHUB_USER }}/${TARGET_REPO_NAME}.git"
-            echo "===== 处理仓库：$TARGET_REPO_NAME ====="
+            # 拆分源仓库和目标仓库名（处理空格问题）
+            IFS=' ' read -r -a PARTS <<< "$ITEM"
+            SOURCE_REPO="${PARTS[0]}"
+            TARGET_REPO_NAME="${PARTS[1]}"
+            TARGET_REPO_URL="https://github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
+            echo "===== 开始处理：$TARGET_REPO_NAME ====="
 
-            # 1. 检查目标仓库是否存在（调用GitHub API）
+            # 1. 检查目标仓库是否存在（修复API调用，用Shell变量）
+            echo "检查仓库 $GITHUB_USER/$TARGET_REPO_NAME 是否存在..."
             RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
               -H "Authorization: token $SYNC_TOKEN" \
-              "https://api.github.com/repos/${{ env.GITHUB_USER }}/${TARGET_REPO_NAME}")
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/$GITHUB_USER/$TARGET_REPO_NAME")
 
-            # 2. 若仓库不存在（HTTP 404），则创建
+            # 2. 不存在则创建仓库（修复JSON转义问题）
             if [ "$RESPONSE" = "404" ]; then
-              echo "仓库 $TARGET_REPO_NAME 不存在，开始创建..."
+              echo "仓库不存在，开始创建 $TARGET_REPO_NAME..."
+              # 用变量存储JSON，避免YAML转义冲突
+              CREATE_JSON=$(jq -n \
+                --arg name "$TARGET_REPO_NAME" \
+                '{
+                  "name": $name,
+                  "private": false,
+                  "auto_init": true,
+                  "description": "Sync from '${SOURCE_REPO}'"
+                }')
+              
               CREATE_RESP=$(curl -s -X POST \
                 -H "Authorization: token $SYNC_TOKEN" \
                 -H "Accept: application/vnd.github.v3+json" \
+                -H "Content-Type: application/json" \
                 https://api.github.com/user/repos \
-                -d '{
-                  "name": "'"$TARGET_REPO_NAME"'",
-                  "private": false,  # 是否私有仓库：false=公开，true=私有
-                  "auto_init": true  # 自动初始化（创建README，避免空仓库推送失败）
-                }')
-              # 检查创建是否成功
-              if echo "$CREATE_RESP" | grep -q "\"id\":"; then
-                echo "仓库 $TARGET_REPO_NAME 创建成功！"
+                -d "$CREATE_JSON")
+              
+              # 检查创建结果
+              if echo "$CREATE_RESP" | jq -e '.id' > /dev/null 2>&1; then
+                echo "✅ 仓库 $TARGET_REPO_NAME 创建成功！"
+                sleep 5  # 延长等待，确保仓库同步到Git服务器
               else
-                echo "仓库 $TARGET_REPO_NAME 创建失败，错误信息：$CREATE_RESP"
-                continue  # 跳过当前仓库，处理下一个
+                echo "❌ 仓库 $TARGET_REPO_NAME 创建失败：$CREATE_RESP"
+                continue
               fi
             elif [ "$RESPONSE" = "200" ]; then
-              echo "仓库 $TARGET_REPO_NAME 已存在，跳过创建"
+              echo "ℹ️ 仓库 $TARGET_REPO_NAME 已存在，跳过创建"
             else
-              echo "检查仓库状态失败，HTTP状态码：$RESPONSE，跳过当前仓库"
+              echo "⚠️ 检查仓库状态失败，HTTP码：$RESPONSE，跳过该仓库"
               continue
             fi
 
-            # 3. 克隆目标仓库（新建仓库需等几秒，避免网络延迟）
-            sleep 3
+            # 3. 克隆目标仓库（带凭证，避免权限问题）
+            echo "克隆目标仓库 $TARGET_REPO_URL..."
             TEMP_DIR=$(mktemp -d)
-            git clone $TARGET_REPO_URL $TEMP_DIR
+            # 替换URL为带TOKEN的格式，避免克隆/推送权限不足
+            AUTH_TARGET_URL="https://$SYNC_TOKEN@github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
+            git clone --depth 1 $AUTH_TARGET_URL $TEMP_DIR
             cd $TEMP_DIR
 
-            # 4. 同步源仓库代码到目标仓库
+            # 4. 同步源仓库代码（自动检测主分支）
+            echo "同步源仓库 $SOURCE_REPO 代码..."
             git remote add source $SOURCE_REPO
-            git fetch source --tags
-            # 强制覆盖（避免冲突，优先源仓库代码）
-            git reset --hard source/main  # 若源仓库主分支是master，改为source/master
-            git push origin main -f  # 推送（-f强制推送，适配新建/已有仓库）
+            git fetch source --tags --depth 1
+            
+            # 自动检测源仓库主分支（兼容main/master）
+            SOURCE_BRANCH=$(git ls-remote --heads source | grep -E 'main|master' | awk '{print $2}' | sed 's/refs\/heads\///' | head -1)
+            if [ -z "$SOURCE_BRANCH" ]; then
+              SOURCE_BRANCH="main"  # 默认分支
+            fi
+            echo "检测到源仓库主分支：$SOURCE_BRANCH"
 
-            # 5. 清理临时目录
+            # 强制覆盖目标仓库
+            git reset --hard "source/$SOURCE_BRANCH"
+            git push origin HEAD:main -f  # 推送到目标仓库main分支
+
+            # 5. 清理临时文件
             cd ..
             rm -rf $TEMP_DIR
-            echo "===== 仓库 $TARGET_REPO_NAME 同步完成 ====="
+            echo "✅ 仓库 $TARGET_REPO_NAME 同步完成！"
             echo "----------------------------------------"
           done
+        # 安装jq工具（用于JSON处理，关键依赖）
+        before_install:
+          - sudo apt-get update && sudo apt-get install -y jq
