@@ -19,6 +19,14 @@ jobs:
           git config --global http.postBuffer 524288000
           git config --global http.lowSpeedLimit 0
           git config --global http.lowSpeedTime 999999
+          
+          # ========== 新增：彻底禁用Git LFS（核心修复） ==========
+          # 跳过LFS文件拉取，避免缺失文件导致失败
+          git config --global filter.lfs.smudge "git-lfs smudge --skip %f"
+          git config --global filter.lfs.process "git-lfs filter-process --skip"
+          git config --global filter.lfs.required false
+          export GIT_LFS_SKIP_SMUDGE=1
+          
           # 安装jq
           sudo apt-get update && sudo apt-get install -y jq
 
@@ -26,11 +34,11 @@ jobs:
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
           GITHUB_USER: "jhonpj"
+          GIT_LFS_SKIP_SMUDGE: 1  # 新增：环境变量层禁用LFS
         run: |
           set -euo pipefail
           
           # ========== 配置同步列表 ==========
-          # 格式："源仓库所有者/源仓库名 目标仓库名"
           SYNC_LIST=(
             "openclaw/openclaw my-openclaw"
             "chaitin/PandaWiki PandaWiki" 
@@ -96,9 +104,16 @@ jobs:
             git remote add origin "$TARGET_REPO_URL"
             git remote add source "https://github.com/$SOURCE_REPO_FULL.git"
             
-            # 拉取源仓库代码
-            git fetch source "$SOURCE_DEFAULT_BRANCH" --tags
+            # ========== 新增：拉取时明确跳过LFS ==========
+            git fetch source "$SOURCE_DEFAULT_BRANCH" --tags --no-lfs
             git checkout -b main "source/$SOURCE_DEFAULT_BRANCH"
+            
+            # 可选：移除LFS追踪规则，避免后续触发LFS
+            if [ -f ".gitattributes" ]; then
+              sed -i '/filter=lfs/d' .gitattributes
+              git add .gitattributes || true
+              git commit -m "Remove LFS tracking" || true
+            fi
             
             # 强制推送到目标仓库
             echo "推送到目标仓库..."
