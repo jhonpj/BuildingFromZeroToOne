@@ -8,106 +8,219 @@ on:
 jobs:
   batch-sync:
     runs-on: ubuntu-latest
+    env:
+      # 全局环境变量，方便统一配置
+      GITHUB_USER: "jhonpj"
+      GIT_LFS_SKIP_SMUDGE: "1"  # 跳过 LFS 文件拉取
+      GIT_HTTP_LOW_SPEED_LIMIT: "0"
+      GIT_HTTP_LOW_SPEED_TIME: "999999"
+      GIT_HTTP_POST_BUFFER: "524288000"
     steps:
       - name: Configure Git and Install Dependencies
         run: |
-          # 配置Git
+          # 配置 Git 基础信息
           git config --global user.name "jhonpj"
           git config --global user.email "pengjingmine@163.com"
           git config --global init.defaultBranch main
-          # 优化Git传输
-          git config --global http.postBuffer 524288000
-          git config --global http.lowSpeedLimit 0
-          git config --global http.lowSpeedTime 999999
-          # 安装jq
-          sudo apt-get update && sudo apt-get install -y jq
+          
+          # 优化 Git 传输
+          git config --global http.postBuffer "$GIT_HTTP_POST_BUFFER"
+          git config --global http.lowSpeedLimit "$GIT_HTTP_LOW_SPEED_LIMIT"
+          git config --global http.lowSpeedTime "$GIT_HTTP_LOW_SPEED_TIME"
+          
+          # 彻底禁用 Git LFS
+          git config --global filter.lfs.smudge "git-lfs smudge --skip %f"
+          git config --global filter.lfs.process "git-lfs filter-process --skip"
+          git config --global filter.lfs.required false
+          
+          # 安装依赖
+          sudo apt-get update && sudo apt-get install -y jq curl
 
       - name: Batch Sync Repos
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
-          GITHUB_USER: "jhonpj"
         run: |
           set -euo pipefail
           
           # ========== 配置同步列表 ==========
-          # 格式："源仓库所有者/源仓库名 目标仓库名"
           SYNC_LIST=(
             "openclaw/openclaw my-openclaw"
-            "chaitin/PandaWiki PandaWiki" 
-            "chaitin/MonkeyCode MonkeyCode" 
-            # 可继续添加："owner/repo target-repo"
+            "chaitin/PandaWiki PandaWiki"
+            "chaitin/MonkeyCode MonkeyCode"
           )
 
+          # ========== 工具函数：清理临时目录 ==========
+          cleanup() {
+            if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
+              rm -rf "$TEMP_DIR"
+              echo "🧹 已清理临时目录：$TEMP_DIR"
+            fi
+          }
+          trap cleanup EXIT  # 脚本退出时自动清理
+
+          # ========== 工具函数：带重试的 API 请求 ==========
+          api_request() {
+            local url="$1"
+            local method="${2:-GET}"
+            local data="${3:-}"
+            local max_retries=3
+            local retry_delay=5
+            
+            for i in $(seq 1 "$max_retries"); do
+              echo "🔄 API 请求（第 $i 次）：$method $url"
+              if [ -n "$data" ]; then
+                RESPONSE=$(curl -s -w "\n%{http_code}" -X "$method" \
+                  -H "Authorization: token $SYNC_TOKEN" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  -H "Content-Type: application/json" \
+                  -d "$data" \
+                  "$url")
+              else
+                RESPONSE=$(curl -s -w "\n%{http_code}" -X "$method" \
+                  -H "Authorization: token $SYNC_TOKEN" \
+                  -H "Accept: application/vnd.github.v3+json" \
+                  "$url")
+              fi
+              
+              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+              BODY=$(echo "$RESPONSE" | sed '$d')
+              
+              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                echo "$BODY"
+                return 0
+              elif [ "$HTTP_CODE" = "429" ]; then
+                echo "⚠️ API 限流，等待 $retry_delay 秒后重试..."
+                sleep "$retry_delay"
+              else
+                echo "⚠️ API 请求失败，HTTP 码：$HTTP_CODE，响应：$BODY"
+                if [ "$i" -lt "$max_retries" ]; then
+                  sleep "$retry_delay"
+                fi
+              fi
+            done
+            
+            echo "❌ API 请求最终失败"
+            return 1
+          }
+
+          # ========== 遍历同步列表 ==========
           for ITEM in "${SYNC_LIST[@]}"; do
             IFS=' ' read -r -a PARTS <<< "$ITEM"
             SOURCE_REPO_FULL="${PARTS[0]}"
             TARGET_REPO_NAME="${PARTS[1]}"
             TARGET_REPO_URL="https://$SYNC_TOKEN@github.com/$GITHUB_USER/$TARGET_REPO_NAME.git"
             
-            echo "===== 开始处理：$TARGET_REPO_NAME ====="
-            echo "源仓库：$SOURCE_REPO_FULL"
+            echo -e "\n===== 🚀 开始处理：$TARGET_REPO_NAME ====="
+            echo "📦 源仓库：$SOURCE_REPO_FULL"
 
-            # 1. 检查目标仓库是否存在，不存在则创建
-            echo "检查目标仓库状态..."
-            CHECK_RESP=$(curl -s -o /dev/null -w "%{http_code}" \
-              -H "Authorization: token $SYNC_TOKEN" \
-              "https://api.github.com/repos/$GITHUB_USER/$TARGET_REPO_NAME")
-
-            if [ "$CHECK_RESP" = "404" ]; then
-              echo "目标仓库不存在，开始创建..."
-              CREATE_RESP=$(curl -s -X POST \
-                -H "Authorization: token $SYNC_TOKEN" \
-                -H "Accept: application/vnd.github.v3+json" \
-                -H "Content-Type: application/json" \
-                https://api.github.com/user/repos \
-                -d "{\"name\":\"$TARGET_REPO_NAME\",\"private\":false,\"auto_init\":true,\"description\":\"Sync from https://github.com/$SOURCE_REPO_FULL\"}")
+            # 1. 检查并创建目标仓库
+            echo "🔍 检查目标仓库状态..."
+            CHECK_BODY=$(api_request "https://api.github.com/repos/$GITHUB_USER/$TARGET_REPO_NAME") || {
+              echo "⚠️ 检查仓库失败，跳过当前仓库"
+              continue
+            }
+            
+            if echo "$CHECK_BODY" | jq -e '.message == "Not Found"' > /dev/null 2>&1; then
+              echo "🆕 目标仓库不存在，开始创建..."
+              CREATE_DATA=$(jq -n \
+                --arg name "$TARGET_REPO_NAME" \
+                --arg desc "Sync from https://github.com/$SOURCE_REPO_FULL" \
+                '{name: $name, private: false, auto_init: true, description: $desc}')
               
-              if echo "$CREATE_RESP" | jq -e '.id' > /dev/null 2>&1; then
-                echo "✅ 仓库创建成功，等待10秒..."
-                sleep 10
+              CREATE_BODY=$(api_request "https://api.github.com/user/repos" "POST" "$CREATE_DATA") || {
+                echo "❌ 仓库创建失败，跳过当前仓库"
+                continue
+              }
+              
+              if echo "$CREATE_BODY" | jq -e '.id' > /dev/null 2>&1; then
+                echo "✅ 仓库创建成功，等待仓库就绪..."
+                # 循环检查仓库是否可克隆，最多等待 30 秒
+                for i in $(seq 1 6); do
+                  sleep 5
+                  if git ls-remote "$TARGET_REPO_URL" > /dev/null 2>&1; then
+                    echo "✅ 仓库已就绪"
+                    break
+                  fi
+                  echo "⏳ 等待仓库就绪（第 $i 次）..."
+                done
               else
-                echo "❌ 仓库创建失败：$CREATE_RESP"
+                echo "❌ 仓库创建失败，响应：$CREATE_BODY"
                 continue
               fi
-            elif [ "$CHECK_RESP" != "200" ]; then
-              echo "⚠️ 检查仓库失败，HTTP码：$CHECK_RESP"
+            elif echo "$CHECK_BODY" | jq -e '.id' > /dev/null 2>&1; then
+              echo "ℹ️ 目标仓库已存在"
+            else
+              echo "⚠️ 检查仓库状态异常，跳过当前仓库"
               continue
             fi
 
-            # 2. 获取源仓库默认分支（关键修复！使用正确的API URL）
-            echo "获取源仓库默认分支..."
-            SOURCE_DEFAULT_BRANCH=$(curl -s \
-              -H "Authorization: token $SYNC_TOKEN" \
-              -H "Accept: application/vnd.github.v3+json" \
-              "https://api.github.com/repos/$SOURCE_REPO_FULL" | jq -r '.default_branch')
-            
-            if [ "$SOURCE_DEFAULT_BRANCH" = "null" ] || [ -z "$SOURCE_DEFAULT_BRANCH" ]; then
-              SOURCE_DEFAULT_BRANCH="main"
+            # 2. 获取源仓库默认分支（API + Git 双重保障）
+            echo "🔀 获取源仓库默认分支..."
+            SOURCE_DEFAULT_BRANCH=""
+            # 优先用 API 获取
+            SOURCE_API_BODY=$(api_request "https://api.github.com/repos/$SOURCE_REPO_FULL") || true
+            if [ -n "$SOURCE_API_BODY" ]; then
+              SOURCE_DEFAULT_BRANCH=$(echo "$SOURCE_API_BODY" | jq -r '.default_branch // empty')
+            fi
+            # API 失败则用 Git 命令获取
+            if [ -z "$SOURCE_DEFAULT_BRANCH" ] || [ "$SOURCE_DEFAULT_BRANCH" = "null" ]; then
+              echo "⚠️ API 获取分支失败，尝试用 Git 命令..."
+              TEMP_GIT_DIR=$(mktemp -d)
+              git init "$TEMP_GIT_DIR" > /dev/null 2>&1
+              git -C "$TEMP_GIT_DIR" remote add source "https://github.com/$SOURCE_REPO_FULL.git" > /dev/null 2>&1
+              SOURCE_DEFAULT_BRANCH=$(git -C "$TEMP_GIT_DIR" ls-remote --symref source HEAD 2>/dev/null | grep 'ref:' | awk '{print $2}' | sed 's/refs\/heads\///' || echo "main")
+              rm -rf "$TEMP_GIT_DIR"
             fi
             echo "✅ 源仓库默认分支：$SOURCE_DEFAULT_BRANCH"
 
-            # 3. 直接镜像同步（最简单稳定的方式）
-            echo "开始同步代码..."
+            # 3. 同步代码
+            echo "📥 开始同步代码..."
             TEMP_DIR=$(mktemp -d)
-            cd $TEMP_DIR
+            cd "$TEMP_DIR"
             
-            # 初始化空仓库
-            git init
+            # 初始化仓库
+            git init -q
             git remote add origin "$TARGET_REPO_URL"
             git remote add source "https://github.com/$SOURCE_REPO_FULL.git"
             
-            # 拉取源仓库代码
-            git fetch source "$SOURCE_DEFAULT_BRANCH" --tags
-            git checkout -b main "source/$SOURCE_DEFAULT_BRANCH"
+            # 拉取源仓库代码（带重试）
+            echo "🔄 拉取源仓库代码..."
+            for i in $(seq 1 3); do
+              if git fetch source "$SOURCE_DEFAULT_BRANCH" --tags -q; then
+                break
+              fi
+              echo "⚠️ 拉取失败（第 $i 次），重试..."
+              sleep 3
+            done
             
-            # 强制推送到目标仓库
-            echo "推送到目标仓库..."
-            git push origin main -f --force-with-lease || git push origin main -f
+            # 切换分支
+            git checkout -b main "source/$SOURCE_DEFAULT_BRANCH" -q
+            
+            # 移除 LFS 追踪
+            if [ -f ".gitattributes" ]; then
+              echo "🧹 移除 LFS 追踪..."
+              sed -i '/filter=lfs/d' .gitattributes
+              git add .gitattributes > /dev/null 2>&1
+              git commit -m "Remove LFS tracking" -q > /dev/null 2>&1 || true
+            fi
+            
+            # 推送到目标仓库（带重试）
+            echo "📤 推送到目标仓库..."
+            for i in $(seq 1 3); do
+              if git push origin main -f --force-with-lease -q || git push origin main -f -q; then
+                echo "✅ 推送成功"
+                break
+              fi
+              echo "⚠️ 推送失败（第 $i 次），重试..."
+              sleep 3
+            done
             
             # 清理
             cd ..
-            rm -rf $TEMP_DIR
+            rm -rf "$TEMP_DIR"
+            TEMP_DIR=""
             
-            echo "✅ $TARGET_REPO_NAME 同步完成！"
-            echo "----------------------------------------"
+            echo "🎉 $TARGET_REPO_NAME 同步完成！"
           done
+          
+          echo -e "\n===== ✨ 所有仓库处理完成 ====="
