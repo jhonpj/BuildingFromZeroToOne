@@ -111,6 +111,3 @@ jobs:
             echo "✅ 仓库 $TARGET_REPO_NAME 同步完成！"
             echo "----------------------------------------"
           done
-        # 安装jq工具（用于JSON处理，关键依赖）
-        before_install:
-          - sudo apt-get update && sudo apt-get install -y jq
