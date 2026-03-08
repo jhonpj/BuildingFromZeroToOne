@@ -1,0 +1,87 @@
+name: Batch Sync with Auto Create Repo
+
+on:
+  schedule:
+    - cron: '0 18 * * *'  # 北京时间凌晨2点执行（UTC 18点）
+  workflow_dispatch:      # 手动触发
+
+jobs:
+  batch-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure Git and Env
+        run: |
+          # 配置Git身份
+          git config --global user.name "jhonpj"
+          git config --global user.email "pengjingmine@163.com"
+          # 设置GitHub用户名（后续API调用用）
+          echo "GITHUB_USER=你的GitHub用户名" >> $GITHUB_ENV
+
+      - name: Batch Sync Repos (Auto Create if Not Exist)
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}  # 你的PAT令牌
+        run: |
+          # ========== 配置同步列表 ==========
+          # 格式："源仓库地址 你的目标仓库名"（注意：目标仓库名是纯名称，不是完整URL）
+          SYNC_LIST=(
+            "https://github.com/openclaw/openclaw.git my-openclaw"
+            # 可继续添加："源仓库URL 目标仓库名"
+          )
+
+          # ========== 核心逻辑：检查+创建仓库 + 同步 ==========
+          for ITEM in "${SYNC_LIST[@]}"; do
+            # 拆分源仓库URL和目标仓库名
+            read -r SOURCE_REPO TARGET_REPO_NAME <<< "$ITEM"
+            TARGET_REPO_URL="https://github.com/${{ env.GITHUB_USER }}/${TARGET_REPO_NAME}.git"
+            echo "===== 处理仓库：$TARGET_REPO_NAME ====="
+
+            # 1. 检查目标仓库是否存在（调用GitHub API）
+            RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: token $SYNC_TOKEN" \
+              "https://api.github.com/repos/${{ env.GITHUB_USER }}/${TARGET_REPO_NAME}")
+
+            # 2. 若仓库不存在（HTTP 404），则创建
+            if [ "$RESPONSE" = "404" ]; then
+              echo "仓库 $TARGET_REPO_NAME 不存在，开始创建..."
+              CREATE_RESP=$(curl -s -X POST \
+                -H "Authorization: token $SYNC_TOKEN" \
+                -H "Accept: application/vnd.github.v3+json" \
+                https://api.github.com/user/repos \
+                -d '{
+                  "name": "'"$TARGET_REPO_NAME"'",
+                  "private": false,  # 是否私有仓库：false=公开，true=私有
+                  "auto_init": true  # 自动初始化（创建README，避免空仓库推送失败）
+                }')
+              # 检查创建是否成功
+              if echo "$CREATE_RESP" | grep -q "\"id\":"; then
+                echo "仓库 $TARGET_REPO_NAME 创建成功！"
+              else
+                echo "仓库 $TARGET_REPO_NAME 创建失败，错误信息：$CREATE_RESP"
+                continue  # 跳过当前仓库，处理下一个
+              fi
+            elif [ "$RESPONSE" = "200" ]; then
+              echo "仓库 $TARGET_REPO_NAME 已存在，跳过创建"
+            else
+              echo "检查仓库状态失败，HTTP状态码：$RESPONSE，跳过当前仓库"
+              continue
+            fi
+
+            # 3. 克隆目标仓库（新建仓库需等几秒，避免网络延迟）
+            sleep 3
+            TEMP_DIR=$(mktemp -d)
+            git clone $TARGET_REPO_URL $TEMP_DIR
+            cd $TEMP_DIR
+
+            # 4. 同步源仓库代码到目标仓库
+            git remote add source $SOURCE_REPO
+            git fetch source --tags
+            # 强制覆盖（避免冲突，优先源仓库代码）
+            git reset --hard source/main  # 若源仓库主分支是master，改为source/master
+            git push origin main -f  # 推送（-f强制推送，适配新建/已有仓库）
+
+            # 5. 清理临时目录
+            cd ..
+            rm -rf $TEMP_DIR
+            echo "===== 仓库 $TARGET_REPO_NAME 同步完成 ====="
+            echo "----------------------------------------"
+          done
